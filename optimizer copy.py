@@ -25,29 +25,24 @@ class Optimizer:
 
         # Basic parameters
         self.T = len(load_data)
-        self.battery_capacity = 53.0   # kWh max
-        self.max_power = 25.0          # kW
+        self.battery_capacity = 53.0  # kWh max
+        self.max_power = 25.0         # kW
         self.eta_charge = 0.95
         self.eta_discharge = 0.95
-
-        # Set time step duration (Δt) based on your data frequency
-        # For example, if data is in 30-minute increments:
-        self.delta_t = 0.5  # hours per time step
 
         # Will be set in build_model()
         self.p_charge = None
         self.p_discharge = None
-        self.p_gridimport = None
-        self.p_gridexport = None
         self.soc = None
+        self.meter_positive = None
+        self.meter_negative = None
         self.M = None
-        self.y = None   # binary variables
         self.prob = None
 
     def build_model(self, time_index):
         """
         Build the optimization model.
-
+        
         Parameters:
         - time_index: pandas Series of timestamps corresponding to each timestep.
         """
@@ -67,83 +62,76 @@ class Optimizer:
         # Decision variables
         self.p_charge = cp.Variable(self.T, nonneg=True)
         self.p_discharge = cp.Variable(self.T, nonneg=True)
-        self.p_gridimport = cp.Variable(self.T, nonneg=True)
-        self.p_gridexport = cp.Variable(self.T, nonneg=True)
         self.soc = cp.Variable(self.T+1)
+        self.meter_positive = cp.Variable(self.T, nonneg=True)
+        self.meter_negative = cp.Variable(self.T, nonneg=True)
         self.M = cp.Variable(nonneg=True)
-
-        # Binary variables for mode selection at each time step
-        self.y = cp.Variable(self.T, boolean=True)
 
         constraints = []
 
-        # Initial and final SOC conditions
+        # Initial condition
         constraints += [self.soc[0] == 0]
 
-        # Battery SOC dynamics
+        # Battery dynamics and constraints
         for t in range(self.T):
             constraints += [
-                self.soc[t+1] == self.soc[t] 
-                                  + self.eta_charge * self.p_charge[t] * self.delta_t
-                                  - (self.p_discharge[t] * self.delta_t / self.eta_discharge),
+                self.soc[t+1] == self.soc[t] + self.p_charge[t]*self.eta_charge - self.p_discharge[t]/self.eta_discharge,
                 self.soc[t+1] <= self.battery_capacity,
-                self.soc[t+1] >= 0
+                self.soc[t+1] >= 0,
             ]
-
-        # End with empty battery
         constraints += [self.soc[self.T] == 0]
 
-        # Battery power limits
+        # Power limits
         constraints += [
             self.p_charge <= self.max_power,
             self.p_discharge <= self.max_power
         ]
 
-        # Battery charging cannot exceed PV
+        # Battery cannot charge more than PV at any time
         for t in range(self.T):
             constraints += [self.p_charge[t] <= self.pv_data[t]]
 
-        # Power balance at the meter:
+        # Meter definition:
+        # meter(t) = load(t) - pv(t) + p_charge(t) - p_discharge(t)
+        # meter(t) = meter_positive(t) - meter_negative(t)
         for t in range(self.T):
             lhs = self.load_data[t] - self.pv_data[t] + self.p_charge[t] - self.p_discharge[t]
-            constraints += [self.p_gridimport[t] - self.p_gridexport[t] == lhs]
+            constraints += [lhs == self.meter_positive[t] - self.meter_negative[t]]
 
-        # Demand charge constraint:
+        # Demand charge constraint: M >= meter_positive(t) during demand window
         for t in range(self.T):
             if in_demand_window[t]:
-                constraints += [self.M >= self.p_gridimport[t]]
-
-        # Big-M constraints for import/export modes
-        M_val = max(np.max(self.load_data), np.max(self.pv_data), self.max_power) * 10
-        for t in range(self.T):
-            constraints += [self.p_gridimport[t] <= M_val * self.y[t]]
-            constraints += [self.p_gridexport[t] <= M_val * (1 - self.y[t])]
+                constraints += [self.M >= self.meter_positive[t]]
 
         # Objective function
-        import_cost = self.prices['import_cost'] * cp.sum(self.p_gridimport * self.delta_t)
+        import_cost = self.prices['import_cost'] * cp.sum(self.meter_positive)
+
+        # Export revenue:
+        # Base export revenue: export_revenue, add demand_response_revenue in DR window
         export_revenue_array = np.full(self.T, self.prices['export_revenue'])
         export_revenue_array[in_dr_window] += self.prices['demand_response_revenue']
-        export_revenue_term = cp.sum(cp.multiply(export_revenue_array, self.p_gridexport) * self.delta_t)
+
+        export_revenue_term = cp.sum(cp.multiply(export_revenue_array, self.meter_negative))
+
+        # Demand charge
         demand_charge_cost = self.prices['demand_charge'] * self.M
 
+        # Objective: minimize import_cost + demand_charge - export_revenue
         objective = cp.Minimize(import_cost + demand_charge_cost - export_revenue_term)
 
         self.prob = cp.Problem(objective, constraints)
 
     def solve(self):
-        # XPRESS can handle MILP problems
         self.prob.solve(solver=cp.XPRESS, verbose=True)
 
         if self.prob.status not in ["infeasible", "unbounded"]:
-            p_charge_val = np.round(self.p_charge.value, 3)
-            p_discharge_val = np.round(self.p_discharge.value, 3)
-            p_gridimport_val = np.round(self.p_gridimport.value, 3)
-            p_gridexport_val = np.round(self.p_gridexport.value, 3)
+            p_charge_val = self.p_charge.value
+            p_discharge_val = self.p_discharge.value
+            meter_positive_val = self.meter_positive.value
+            meter_negative_val = self.meter_negative.value
 
-            # Battery power = p_discharge - p_charge
-            battery_power_val = np.round(p_discharge_val - p_charge_val, 3)
-            # Meter = p_gridimport - p_gridexport
-            meter_val = np.round(p_gridimport_val - p_gridexport_val, 3)
+            battery_power_val = p_charge_val - p_discharge_val
+            meter_val = meter_positive_val - meter_negative_val
 
             return {
                 'battery_power': battery_power_val,

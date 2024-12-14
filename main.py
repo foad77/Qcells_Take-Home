@@ -4,7 +4,7 @@ from optimizer import Optimizer
 
 def run_optimization():
     # Load data
-    df = pd.read_csv('data/profiles.csv', parse_dates=['Time'])
+    df = pd.read_csv('data/profiles.csv', parse_dates=['Time'],date_parser=lambda x: pd.to_datetime(x, format='%m/%d/%y %H:%M'))
     
     # Extract load and PV data
     load_data = df['Load (kW)'].values
@@ -25,7 +25,7 @@ def run_optimization():
     
     # Instantiate and run the optimizer
     optimizer = Optimizer(load_data, pv_data, prices)
-    optimizer.build_model()
+    optimizer.build_model(time_index)
     solution = optimizer.solve()  # Suppose this returns a dict or dataframe with Time, AC Battery Power, Meter
     
     # Write results
